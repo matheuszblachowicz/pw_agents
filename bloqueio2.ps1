@@ -1,19 +1,36 @@
 ﻿# =========================================================================
-# AGENTE GDI - PLATTrust (VERSÃO FINAL: HISTÓRICO WEB CORRIGIDO E ATIVO)
+# AGENTE GDI - PLATTrust (CAPTAÇÃO DE DADOS, APPS E KIOSK MODE BLINDADO)
 # =========================================================================
 try { [Console]::OutputEncoding = New-Object System.Text.Encoding.UTF8Encoding($false) } catch {}
 
-# --- [ PARÂMETROS GLOBAIS DE SEGURANÇA E API ] ---
-$script:ModoTeste = $true  # TRUE: Permite fechar com Alt+F4 | FALSE: Bloqueio Total
-$script:UrlBase = "http://127.0.0.1:8000/api/agent" 
+$script:ModoTeste = $true # ATENÇÃO: EM $FALSE O BLOQUEIO É REAL E IMPLACÁVEL
+$script:UrlBase = "http://gdi.platlog.com.br:4040/api/agent" 
 $script:ArquivoCache = "$env:APPDATA\JDILab_Assinado.lock"
+$script:CaminhoImagem = "\\172.20.31.123\EMPRESA\JDI\TECNOLOGIA\termos\ARTE QRCODE TERMOS TI.PNG"
 $script:Maquina = $env:COMPUTERNAME
+$script:UltimaColetaApps = (Get-Date).AddHours(-2) 
 
+# --- CORREÇÃO DE DPI (EVITA BUGS DE ESCALA EM MULTI-MONITOR) ---
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'DPI').Type) {
+        $DpiCode = @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class DPI {
+            [DllImport("user32.dll")]
+            public static extern bool SetProcessDPIAware();
+        }
+"@
+        Add-Type -TypeDefinition $DpiCode
+        [void][DPI]::SetProcessDPIAware()
+    }
+} catch {}
+
+[System.Windows.Forms.Application]::EnableVisualStyles()
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, System.Device
 
-# --- CLASSE C# PARA CAPTURAR A JANELA EXATA EM FOCO ---
+# --- CLASSE WIN32 ---
 try {
-    # AQUI ESTAVA O BUG: O parâmetro 'out int lpdwProcessId' impedia o crash do PowerShell
     Add-Type @"
     using System;
     using System.Runtime.InteropServices;
@@ -27,8 +44,19 @@ try {
 } catch {} 
 
 # =========================================================================
-# 1. FUNÇÕES DE REDE E LOCALIZAÇÃO
+# 1. FUNÇÕES DE SUPORTE E COLETA
 # =========================================================================
+
+function Get-LoggedOnUser {
+    try {
+        $user = (Get-WmiObject -Class Win32_ComputerSystem).UserName
+        if (-not [string]::IsNullOrWhiteSpace($user)) { return $user.Split('\')[-1] }
+        $explorer = Get-WmiObject Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
+        if ($explorer) { $owner = $explorer.GetOwner(); if ($owner.User) { return $owner.User } }
+        return $env:USERNAME
+    } catch { return "Desconhecido" }
+}
+
 function Get-NetworkData {
     $ip = (Get-NetRoute -DestinationPrefix 0.0.0.0/0 -ErrorAction SilentlyContinue | Get-NetIPAddress | Where-Object AddressFamily -eq 'IPv4').IPAddress | Select-Object -First 1
     $mac = (Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true -and $_.Description -notmatch 'Virtual|Pseudo' }).MACAddress | Select-Object -First 1
@@ -47,7 +75,7 @@ function Get-LocationData {
         if (-not $loc.IsUnknown) { $lat = $($loc.Latitude).ToString().Replace(',','.'); $lng = $($loc.Longitude).ToString().Replace(',','.') }
         $watcher.Stop()
     } catch {}
-
+    
     $wifiListTemp = @()
     try {
         $netshOutput = @(netsh wlan show networks mode=bssid)
@@ -61,258 +89,302 @@ function Get-LocationData {
     } catch {}
 
     $wifiList = @()
-    if ($wifiListTemp.Count -ge 3) { $wifiList = $wifiListTemp | Select-Object -First 15 }
-    return @{ wifi = $wifiList; lat = $lat; lng = $lng; totalEncontrado = $wifiListTemp.Count }
+    if ($wifiListTemp.Count -ge 2) { $wifiList = $wifiListTemp | Select-Object -First 15 }
+    return @{ wifi = $wifiList; lat = $lat; lng = $lng }
 }
 
-# =========================================================================
-# 2. CONTROLE DE AMBIENTE E TELAS
-# =========================================================================
-function Bloquear-Ambiente {
-    if (-not $script:ModoTeste) {
-        Stop-Process -Name "explorer" -Force -ErrorAction SilentlyContinue
-        $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
-        if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
-        Set-ItemProperty -Path $path -Name "DisableTaskMgr" -Value 1 -Force
-    }
-}
-
-function Desbloquear-Ambiente {
-    if (-not $script:ModoTeste) {
-        $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
-        if (Test-Path $path) { Remove-ItemProperty -Path $path -Name "DisableTaskMgr" -ErrorAction SilentlyContinue }
-        if (-not (Get-Process "explorer" -ErrorAction SilentlyContinue)) { Start-Process "explorer.exe" }
-    }
-}
-
-function Show-TelaTermo([string]$Mensagem) {
-    Bloquear-Ambiente; $Global:PodeFechar = $false; $Forms = New-Object System.Collections.Generic.List[System.Windows.Forms.Form]
-    foreach ($scr in [System.Windows.Forms.Screen]::AllScreens) {
-        $f = New-Object System.Windows.Forms.Form; $f.BackColor = "Black"; $f.FormBorderStyle = "None"; $f.TopMost = $true; $f.Bounds = $scr.Bounds; $f.ShowInTaskbar = $false
-        $f.Add_Closing({ param($s, $e) if (-not $Global:PodeFechar -and -not $script:ModoTeste) { $e.Cancel = $true } })
-        $p = New-Object System.Windows.Forms.Panel; $p.Dock = "Fill"; $f.Controls.Add($p)
-        if ($scr.Primary) {
-            $Global:MainForm = $f
-            $lblT = New-Object System.Windows.Forms.Label; $lblT.Text = "ASSINATURA PENDENTE"; $lblT.ForeColor = "DeepSkyBlue"; $lblT.Dock = "Top"; $lblT.Height = 150; $lblT.TextAlign = "MiddleCenter"; $lblT.Font = "Segoe UI, 32, Bold"
-            $lblM = New-Object System.Windows.Forms.Label; $lblM.Text = $Mensagem; $lblM.ForeColor = "Silver"; $lblM.Dock = "Top"; $lblM.Height = 100; $lblM.TextAlign = "MiddleCenter"; $lblM.Font = "Segoe UI, 16"
-            $txt = New-Object System.Windows.Forms.TextBox; $txt.Size = "400,50"; $txt.Top = 350; $txt.Left = ($scr.Bounds.Width/2)-200; $txt.TextAlign = "Center"; $txt.Font = "Consolas, 24"; $p.Controls.Add($txt)
-            $btn = New-Object System.Windows.Forms.Button; $btn.Text = "VALIDAR CPF"; $btn.Size = "200,60"; $btn.Top = 420; $btn.Left = ($scr.Bounds.Width/2)-100; $btn.BackColor = "Green"; $btn.ForeColor = "White"
-            $btn.Add_Click({
-                $res = Send-VerifyMachine -CpfDigitado $txt.Text
-                if ($res.action -eq "allow") { $Global:PodeFechar = $true; foreach($frm in $Forms){$frm.Close()}; Desbloquear-Ambiente }
-                else { [System.Windows.Forms.MessageBox]::Show($res.message, "Atenção") }
-            })
-            $p.Controls.Add($btn); $f.Add_Shown({ $txt.Focus() }); $p.Controls.Add($lblM); $p.Controls.Add($lblT)
-        }
-        $Forms.Add($f)
-    }
-    foreach ($frm in $Forms) { if ($frm -ne $Global:MainForm) { $frm.Show() } }; $Global:MainForm.ShowDialog()
-}
-
-function Show-TelaHorario([string]$Mensagem) {
-    Bloquear-Ambiente; $Global:PodeFechar = $false; $Forms = New-Object System.Collections.Generic.List[System.Windows.Forms.Form]
-    foreach ($scr in [System.Windows.Forms.Screen]::AllScreens) {
-        $f = New-Object System.Windows.Forms.Form; $f.BackColor = "Black"; $f.FormBorderStyle = "None"; $f.TopMost = $true; $f.Bounds = $scr.Bounds; $f.ShowInTaskbar = $false
-        $f.Add_Closing({ param($s, $e) if (-not $Global:PodeFechar -and -not $script:ModoTeste) { $e.Cancel = $true } })
-        $p = New-Object System.Windows.Forms.Panel; $p.Dock = "Fill"; $f.Controls.Add($p)
-        if ($scr.Primary) {
-            $Global:MainForm = $f
-            $lblT = New-Object System.Windows.Forms.Label; $lblT.Text = "EXPEDIENTE ENCERRADO"; $lblT.ForeColor = "Orange"; $lblT.Dock = "Top"; $lblT.Height = 150; $lblT.TextAlign = "MiddleCenter"; $lblT.Font = "Segoe UI, 32, Bold"
-            $lblM = New-Object System.Windows.Forms.Label; $lblM.Text = $Mensagem; $lblM.ForeColor = "Silver"; $lblM.Dock = "Top"; $lblM.Height = 100; $lblM.TextAlign = "MiddleCenter"; $lblM.Font = "Segoe UI, 16"
-            $btn = New-Object System.Windows.Forms.Button; $btn.Text = "VERIFICAR HORÁRIO"; $btn.Size = "250,60"; $btn.Top = 350; $btn.Left = ($scr.Bounds.Width/2)-125; $btn.BackColor = "#0ea5e9"; $btn.ForeColor = "White"; $btn.Font = "Segoe UI, 12, Bold"
-            $btn.Add_Click({
-                $res = Get-WorkingHoursStatus
-                if ($res.action -eq "allow") { $Global:PodeFechar = $true; foreach($frm in $Forms){$frm.Close()}; Desbloquear-Ambiente }
-            })
-            $p.Controls.Add($btn); $p.Controls.Add($lblM); $p.Controls.Add($lblT)
-        }
-        $Forms.Add($f)
-    }
-    foreach ($frm in $Forms) { if ($frm -ne $Global:MainForm) { $frm.Show() } }; $Global:MainForm.ShowDialog()
-}
-
-function Show-TelaManual([string]$Mensagem) {
-    Bloquear-Ambiente; $Global:PodeFechar = $false; $Forms = New-Object System.Collections.Generic.List[System.Windows.Forms.Form]
-    foreach ($scr in [System.Windows.Forms.Screen]::AllScreens) {
-        $f = New-Object System.Windows.Forms.Form; $f.BackColor = "Black"; $f.FormBorderStyle = "None"; $f.TopMost = $true; $f.Bounds = $scr.Bounds; $f.ShowInTaskbar = $false
-        $f.Add_Closing({ param($s, $e) if (-not $Global:PodeFechar -and -not $script:ModoTeste) { $e.Cancel = $true } })
-        $p = New-Object System.Windows.Forms.Panel; $p.Dock = "Fill"; $f.Controls.Add($p)
-        if ($scr.Primary) {
-            $Global:MainForm = $f
-            $lblT = New-Object System.Windows.Forms.Label; $lblT.Text = "ACESSO SUSPENSO"; $lblT.ForeColor = "Red"; $lblT.Dock = "Top"; $lblT.Height = 150; $lblT.TextAlign = "MiddleCenter"; $lblT.Font = "Segoe UI, 32, Bold"
-            $lblM = New-Object System.Windows.Forms.Label; $lblM.Text = $Mensagem; $lblM.ForeColor = "Silver"; $lblM.Dock = "Top"; $lblM.Height = 100; $lblM.TextAlign = "MiddleCenter"; $lblM.Font = "Segoe UI, 16"
-            $btn = New-Object System.Windows.Forms.Button; $btn.Text = "ATUALIZAR STATUS"; $btn.Size = "250,60"; $btn.Top = 350; $btn.Left = ($scr.Bounds.Width/2)-125; $btn.BackColor = "#475569"; $btn.ForeColor = "White"; $btn.Font = "Segoe UI, 12, Bold"
-            $btn.Add_Click({
-                $vCpf = if (Test-Path $script:ArquivoCache) { (Get-Content $script:ArquivoCache).Trim() } else { "" }
-                $res = Send-VerifyMachine -CpfDigitado $vCpf
-                if ($res.action -eq "allow") { $Global:PodeFechar = $true; foreach($frm in $Forms){$frm.Close()}; Desbloquear-Ambiente }
-            })
-            $p.Controls.Add($btn); $p.Controls.Add($lblM); $p.Controls.Add($lblT)
-        }
-        $Forms.Add($f)
-    }
-    foreach ($frm in $Forms) { if ($frm -ne $Global:MainForm) { $frm.Show() } }; $Global:MainForm.ShowDialog()
-}
-
-# =========================================================================
-# 4. COMUNICAÇÃO COM A API DO LARAVEL
-# =========================================================================
-
-function Send-VerifyMachine {
-    param ([string]$CpfDigitado)
-    $net = Get-NetworkData
-    $loc = Get-LocationData
+function Send-ApplicationsLog {
+    $appsList = New-Object System.Collections.Generic.List[PSCustomObject]
+    $paths = @("HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall", "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall")
     
-    $payload = @{
-        hostname = $script:Maquina; cpf = ($CpfDigitado -replace "[^0-9]", "")
-        mac_address = $net.mac; ip_address = $net.ip
-        wifiAccessPoints = $loc.wifi; latitude = $loc.lat; longitude = $loc.lng
-        os_version = (Get-WmiObject Win32_OperatingSystem).Caption
-    }
-    
-    $jsonString = $payload | ConvertTo-Json -Compress
-    $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($jsonString)
-
-    try { 
-        return Invoke-RestMethod -Uri "$script:UrlBase/verify" -Method Post -Body $jsonBytes -ContentType "application/json; charset=utf-8" 
-    } catch { 
-        return @{ action = "block"; message = "Sem conexão com o servidor." } 
-    }
-}
-
-function Get-WorkingHoursStatus {
-    $jsonString = @{hostname=$script:Maquina} | ConvertTo-Json -Compress
-    $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($jsonString)
-
-    try { 
-        return Invoke-RestMethod -Uri "$script:UrlBase/check-working-hours" -Method Post -Body $jsonBytes -ContentType "application/json; charset=utf-8" 
-    } catch { 
-        return @{ action = "allow" } 
-    }
-}
-
-function Send-ApplicationsList {
-    Write-Host "-> Sincronizando TODAS as aplicações com o Laravel..." -ForegroundColor Cyan
-    $paths = @(
-        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
-    )
-    
-    $appsBrutos = Get-ItemProperty $paths -ErrorAction SilentlyContinue 
-    $appsArray = @()
-    $nomesVistos = @{} 
-    
-    foreach ($app in $appsBrutos) {
-        if ($null -ne $app.DisplayName) {
-            $nome = [string]($app.DisplayName | Out-String).Trim() -replace "`r|`n|`t", " " -replace '"', "'"
-            $versao = [string]($app.DisplayVersion | Out-String).Trim() -replace "`r|`n|`t", " " -replace '"', "'"
-            
-            if ($nome.Length -gt 0) {
-                if ($versao.Length -eq 0) { $versao = "1.0" }
-                if ($nome.Length -gt 250) { $nome = $nome.Substring(0, 250) }
-                if ($versao.Length -gt 250) { $versao = $versao.Substring(0, 250) }
-
-                if (-not $nomesVistos.ContainsKey($nome)) {
-                    $nomesVistos[$nome] = $true
-                    $appsArray += [PSCustomObject]@{ Name = $nome; Version = $versao }
+    foreach ($path in $paths) {
+        if (Test-Path $path) {
+            $subChaves = Get-ChildItem -Path $path -ErrorAction SilentlyContinue
+            foreach ($chave in $subChaves) {
+                $item = Get-ItemProperty -Path $chave.PSPath -ErrorAction SilentlyContinue
+                if ($item -and -not [string]::IsNullOrWhiteSpace($item.DisplayName)) {
+                    $appObj = [PSCustomObject]@{
+                        name = [string]$item.DisplayName
+                        version = if (-not [string]::IsNullOrWhiteSpace($item.DisplayVersion)) { [string]$item.DisplayVersion } else { "1.0" }
+                    }
+                    $appsList.Add($appObj)
                 }
             }
         }
     }
     
-    $payload = @{ hostname = $script:Maquina; applications = $appsArray }
-    $jsonString = $payload | ConvertTo-Json -Depth 5 -Compress
-    $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($jsonString)
+    $aplicacoesUnicas = $appsList | Sort-Object -Property name -Unique
+    $payload = @{ hostname = $script:Maquina; applications = @($aplicacoesUnicas) }
+    $jsonPayload = $payload | ConvertTo-Json -Depth 10 -Compress
+    try { Invoke-RestMethod -Uri "$script:UrlBase/applications" -Method Post -Body $jsonPayload -ContentType "application/json" | Out-Null } catch {}
+}
 
-    try { 
-        Invoke-RestMethod -Uri "$script:UrlBase/applications" -Method Post -Body $jsonBytes -ContentType "application/json; charset=utf-8" | Out-Null
-        Write-Host "[OK] Lista de Aplicações enviada com sucesso!" -ForegroundColor Green
-    } catch {
-        Write-Host "[ERRO] Falha ao enviar Aplicações: $($_.Exception.Message)" -ForegroundColor Red
+# --- KIOSK MODE: ISOLAMENTO TOTAL ---
+function Bloquear-Ambiente {
+    if (-not $script:ModoTeste) {
+        # Mata processos vitais
+        Get-Process -Name "explorer", "taskmgr" -ErrorAction SilentlyContinue | Stop-Process -Force
+        
+        # Políticas de Segurança (Regedit)
+        $sysPolicies = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        $expPolicies = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+        
+        if (-not (Test-Path $sysPolicies)) { New-Item -Path $sysPolicies -Force | Out-Null }
+        if (-not (Test-Path $expPolicies)) { New-Item -Path $expPolicies -Force | Out-Null }
+        
+        Set-ItemProperty -Path $sysPolicies -Name "DisableTaskMgr" -Value 1 -Force
+        Set-ItemProperty -Path $sysPolicies -Name "DisableLockWorkstation" -Value 1 -Force # Bloqueia Win+L
+        Set-ItemProperty -Path $sysPolicies -Name "DisableChangePassword" -Value 1 -Force # Bloqueia Ctrl+Alt+Del parcial
+        Set-ItemProperty -Path $expPolicies -Name "NoLogoff" -Value 1 -Force # Impede fuga por logoff
     }
+}
+
+function Desbloquear-Ambiente {
+    if (-not $script:ModoTeste) {
+        $sysPolicies = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        $expPolicies = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+        
+        Remove-ItemProperty -Path $sysPolicies -Name "DisableTaskMgr" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $sysPolicies -Name "DisableLockWorkstation" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $sysPolicies -Name "DisableChangePassword" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $expPolicies -Name "NoLogoff" -ErrorAction SilentlyContinue
+        
+        if (-not (Get-Process "explorer" -ErrorAction SilentlyContinue)) { Start-Process "explorer.exe" }
+    }
+}
+
+# =========================================================================
+# 2. INTERFACES GRÁFICAS (TELAS KIOSK)
+# =========================================================================
+
+# --- TELA 1: BLOQUEIO MANUAL ---
+function Show-TelaManual([string]$Mensagem) {
+    Bloquear-Ambiente; $Global:PodeFechar = $false; $Forms = New-Object System.Collections.Generic.List[System.Windows.Forms.Form]
+    
+    $script:ApiTick = 0
+    $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 1000 
+    $timer.Add_Tick({
+        # CÃO DE GUARDA (WATCHDOG): Roda a cada 1 segundo
+        if (-not $script:ModoTeste) {
+            Get-Process -Name "taskmgr" -ErrorAction SilentlyContinue | Stop-Process -Force
+            # Puxa o foco de TODAS as telas conectadas para impedir Alt+Tab
+            foreach($frm in $Forms){ $frm.TopMost = $true; $frm.BringToFront(); $frm.Activate() }
+        }
+
+        $script:ApiTick++
+        if ($script:ApiTick -ge 10) { # Consulta API a cada 10s
+            $script:ApiTick = 0
+            $vCpf = if (Test-Path $script:ArquivoCache) { (Get-Content $script:ArquivoCache).Trim() } else { "" }
+            $res = Send-VerifyMachine -CpfDigitado $vCpf
+            if ($res.action -eq "allow" -or $res.action -eq "block_termo") { 
+                $timer.Stop(); $Global:PodeFechar = $true; foreach($frm in $Forms){$frm.Close()}; Desbloquear-Ambiente 
+            }
+        }
+    })
+
+    # CRIA UMA JAULA EM CADA MONITOR DETECTADO
+    foreach ($scr in [System.Windows.Forms.Screen]::AllScreens) {
+        $f = New-Object System.Windows.Forms.Form
+        $f.StartPosition = "Manual"
+        $f.Location = $scr.Bounds.Location
+        $f.Size = $scr.Bounds.Size
+        $f.BackColor = [System.Drawing.Color]::FromArgb(15, 23, 42)
+        $f.FormBorderStyle = "None"; $f.TopMost = $true; $f.ShowInTaskbar = $false
+        $f.Add_Closing({ param($s, $e) if (-not $Global:PodeFechar -and -not $script:ModoTeste) { $e.Cancel = $true } })
+        
+        if ($scr.Primary) {
+            $Global:MainForm = $f
+            $layout = New-Object System.Windows.Forms.TableLayoutPanel; $layout.Dock = "Fill"; $layout.ColumnCount = 1; $layout.RowCount = 4
+            $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 20))) | Out-Null
+            $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 20))) | Out-Null
+            $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 40))) | Out-Null
+            $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 20))) | Out-Null
+            $f.Controls.Add($layout)
+            
+            $lblT = New-Object System.Windows.Forms.Label; $lblT.Text = "ESTAÇÃO BLOQUEADA"; $lblT.ForeColor = [System.Drawing.Color]::FromArgb(239, 68, 68)
+            $lblT.Font = New-Object System.Drawing.Font("Segoe UI", 48, [System.Drawing.FontStyle]::Bold); $lblT.TextAlign = "BottomCenter"; $lblT.Dock = "Fill"; $layout.Controls.Add($lblT, 0, 0)
+            
+            $lblIcon = New-Object System.Windows.Forms.Label; $lblIcon.Text = "🔒"; $lblIcon.ForeColor = [System.Drawing.Color]::White; $lblIcon.Font = New-Object System.Drawing.Font("Segoe UI", 70); $lblIcon.TextAlign = "MiddleCenter"; $lblIcon.Dock = "Fill"; $layout.Controls.Add($lblIcon, 0, 1)
+
+            $lblM = New-Object System.Windows.Forms.Label; $lblM.Text = $Mensagem; $lblM.ForeColor = [System.Drawing.Color]::FromArgb(250, 204, 21)
+            $lblM.Font = New-Object System.Drawing.Font("Segoe UI", 36, [System.Drawing.FontStyle]::Bold); $lblM.TextAlign = "MiddleCenter"; $lblM.Dock = "Fill"; $layout.Controls.Add($lblM, 0, 2)
+            
+            $pnlBtn = New-Object System.Windows.Forms.Panel; $pnlBtn.Dock = "Fill"; $layout.Controls.Add($pnlBtn, 0, 3)
+            $btn = New-Object System.Windows.Forms.Button; $btn.Text = "SOLICITAR DESBLOQUEIO"; $btn.Size = New-Object System.Drawing.Size(400, 70); $btn.Left = ($scr.Bounds.Width/2)-200; $btn.Top = 20
+            $btn.BackColor = [System.Drawing.Color]::FromArgb(220, 38, 38); $btn.ForeColor = [System.Drawing.Color]::White; $btn.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold); $btn.FlatStyle = "Flat"
+            
+            $btn.Add_Click({
+                $btn.Text = "Verificando aguarde..."; $btn.Enabled = $false; [System.Windows.Forms.Application]::DoEvents()
+                $vCpf = if (Test-Path $script:ArquivoCache) { (Get-Content $script:ArquivoCache).Trim() } else { "" }
+                $res = Send-VerifyMachine -CpfDigitado $vCpf
+                if ($res.action -eq "allow" -or $res.action -eq "block_termo") { 
+                    $timer.Stop(); $Global:PodeFechar = $true; foreach($frm in $Forms){$frm.Close()}; Desbloquear-Ambiente 
+                } else { 
+                    $lblM.Text = $res.message 
+                    [System.Windows.Forms.MessageBox]::Show("O acesso continua bloqueado pelo administrador da PLATLOG.`n`nMotivo: " + $res.message, "Acesso Negado", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                    $btn.Text = "SOLICITAR DESBLOQUEIO"; $btn.Enabled = $true 
+                }
+            })
+            $pnlBtn.Controls.Add($btn)
+        } else {
+            $lbl = New-Object System.Windows.Forms.Label; $lbl.Text = "BLOQUEADO"; $lbl.ForeColor = [System.Drawing.Color]::FromArgb(30, 41, 59); $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 40, [System.Drawing.FontStyle]::Bold)
+            $lbl.Dock = "Fill"; $lbl.TextAlign = "MiddleCenter"; $f.Controls.Add($lbl)
+        }
+        $Forms.Add($f)
+    }
+    $timer.Start(); foreach ($frm in $Forms) { if ($frm -ne $Global:MainForm) { $frm.Show() } }; $Global:MainForm.ShowDialog()
+}
+
+# --- TELA 2: TERMO DE USO ---
+function Show-TelaTermo([string]$Mensagem) {
+    Bloquear-Ambiente; $Global:PodeFechar = $false; $Forms = New-Object System.Collections.Generic.List[System.Windows.Forms.Form]
+    
+    $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 1000 
+    $timer.Add_Tick({
+        if (-not $script:ModoTeste) {
+            Get-Process -Name "taskmgr" -ErrorAction SilentlyContinue | Stop-Process -Force
+            foreach($frm in $Forms){ $frm.TopMost = $true; $frm.BringToFront(); $frm.Activate() }
+        }
+    })
+
+    foreach ($scr in [System.Windows.Forms.Screen]::AllScreens) {
+        $f = New-Object System.Windows.Forms.Form
+        $f.StartPosition = "Manual"; $f.Location = $scr.Bounds.Location; $f.Size = $scr.Bounds.Size
+        $f.BackColor = "Black"; $f.FormBorderStyle = "None"; $f.TopMost = $true; $f.ShowInTaskbar = $false
+        $f.Add_Closing({ param($s, $e) if (-not $Global:PodeFechar -and -not $script:ModoTeste) { $e.Cancel = $true } })
+        
+        if ($scr.Primary) {
+            $Global:MainForm = $f
+            $p = New-Object System.Windows.Forms.TableLayoutPanel; $p.Dock = "Fill"; $p.ColumnCount = 2
+            $p.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50))) | Out-Null
+            $p.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50))) | Out-Null
+            $f.Controls.Add($p)
+            $pLeft = New-Object System.Windows.Forms.Panel; $pLeft.Dock = "Fill"; $p.Controls.Add($pLeft, 0, 0)
+            
+            $lblT = New-Object System.Windows.Forms.Label; $lblT.Text = "ACESSO RESTRITO`nPLATLOG"; $lblT.ForeColor = "Red"; $lblT.Font = "Segoe UI, 28, Bold"; $lblT.TextAlign = "MiddleCenter"; $lblT.Size = "500,150"; $lblT.Location = "50,100"; $pLeft.Controls.Add($lblT)
+            $txt = New-Object System.Windows.Forms.TextBox; $txt.Size = "350,45"; $txt.Location = "125,350"; $txt.Font = "Consolas, 24"; $txt.TextAlign = "Center"; $pLeft.Controls.Add($txt)
+            $btn = New-Object System.Windows.Forms.Button; $btn.Text = "VALIDAR CPF"; $btn.Size = "200,50"; $btn.Location = "200,420"; $btn.BackColor = "Green"; $btn.ForeColor = "White"; $btn.FlatStyle = "Flat"
+            
+            $btn.Add_Click({
+                $res = Send-VerifyMachine -CpfDigitado $txt.Text
+                if ($res.action -eq "allow") { 
+                    $timer.Stop(); $Global:PodeFechar = $true; Set-Content -Path $script:ArquivoCache -Value ($txt.Text -replace "[^0-9]", "") -Force
+                    foreach($frm in $Forms){$frm.Close()}; Desbloquear-Ambiente 
+                } else { [System.Windows.Forms.MessageBox]::Show($res.message, "Atenção") }
+            })
+            $pLeft.Controls.Add($btn)
+            
+            $pRight = New-Object System.Windows.Forms.PictureBox; $pRight.Dock = "Fill"; $pRight.SizeMode = "StretchImage"
+            if(Test-Path $script:CaminhoImagem){ try{$pRight.Image = [System.Drawing.Image]::FromFile($script:CaminhoImagem)}catch{} }
+            $p.Controls.Add($pRight, 1, 0)
+        } else { 
+            $lbl = New-Object System.Windows.Forms.Label; $lbl.Text = "BLOQUEADO"; $lbl.ForeColor = [System.Drawing.Color]::FromArgb(40,40,40); $lbl.Font = "Segoe UI, 40, Bold"; $lbl.Dock = "Fill"; $lbl.TextAlign = "MiddleCenter"; $f.Controls.Add($lbl) 
+        }
+        $Forms.Add($f)
+    }
+    $timer.Start(); foreach ($frm in $Forms) { if ($frm -ne $Global:MainForm) { $frm.Show() } }; $Global:MainForm.ShowDialog()
+}
+
+# --- TELA 3: HORÁRIO ---
+function Show-TelaHorario([string]$Mensagem) {
+    Bloquear-Ambiente; $Global:PodeFechar = $false; $Forms = New-Object System.Collections.Generic.List[System.Windows.Forms.Form]
+    
+    $script:HoraTick = 0
+    $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 1000 
+    $timer.Add_Tick({
+        if (-not $script:ModoTeste) {
+            Get-Process -Name "taskmgr" -ErrorAction SilentlyContinue | Stop-Process -Force
+            foreach($frm in $Forms){ $frm.TopMost = $true; $frm.BringToFront(); $frm.Activate() }
+        }
+        
+        $script:HoraTick++
+        if ($script:HoraTick -ge 10) {
+            $script:HoraTick = 0
+            $res = Get-WorkingHoursStatus
+            if ($res.action -eq "allow") { $timer.Stop(); $Global:PodeFechar = $true; foreach($frm in $Forms){$frm.Close()}; Desbloquear-Ambiente }
+        }
+    })
+
+    foreach ($scr in [System.Windows.Forms.Screen]::AllScreens) {
+        $f = New-Object System.Windows.Forms.Form
+        $f.StartPosition = "Manual"; $f.Location = $scr.Bounds.Location; $f.Size = $scr.Bounds.Size
+        $f.BackColor = "Black"; $f.FormBorderStyle = "None"; $f.TopMost = $true; $f.ShowInTaskbar = $false
+        $f.Add_Closing({ param($s, $e) if (-not $Global:PodeFechar -and -not $script:ModoTeste) { $e.Cancel = $true } })
+        
+        if ($scr.Primary) {
+            $Global:MainForm = $f
+            $layout = New-Object System.Windows.Forms.TableLayoutPanel; $layout.Dock = "Fill"; $layout.ColumnCount = 1; $layout.RowCount = 4
+            $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 20))) | Out-Null
+            $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 40))) | Out-Null
+            $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 20))) | Out-Null
+            $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 20))) | Out-Null
+            $f.Controls.Add($layout)
+            
+            $lblT = New-Object System.Windows.Forms.Label; $lblT.Text = "EXPEDIENTE ENCERRADO"; $lblT.ForeColor = "Orange"; $lblT.Font = "Segoe UI, 36, Bold"; $lblT.TextAlign = "MiddleCenter"; $lblT.Dock = "Fill"; $layout.Controls.Add($lblT, 0, 0)
+            $lblClock = New-Object System.Windows.Forms.Label; $lblClock.Text = "⏰"; $lblClock.ForeColor = "Orange"; $lblClock.Font = "Segoe UI, 130"; $lblClock.TextAlign = "MiddleCenter"; $lblClock.Dock = "Fill"; $layout.Controls.Add($lblClock, 0, 1)
+            $lblM = New-Object System.Windows.Forms.Label; $lblM.Text = $Mensagem; $lblM.ForeColor = "Silver"; $lblM.Font = "Segoe UI, 16"; $lblM.TextAlign = "MiddleCenter"; $lblM.Dock = "Fill"; $layout.Controls.Add($lblM, 0, 2)
+            
+            $pnlBtn = New-Object System.Windows.Forms.Panel; $pnlBtn.Dock = "Fill"; $layout.Controls.Add($pnlBtn, 0, 3)
+            $btn = New-Object System.Windows.Forms.Button; $btn.Text = "VERIFICAR HORÁRIO"; $btn.Size = New-Object System.Drawing.Size(280, 60); $btn.Left = ($scr.Bounds.Width/2)-140; $btn.Top = 10
+            $btn.BackColor = "#f59e0b"; $btn.ForeColor = "White"; $btn.Font = "Segoe UI, 12, Bold"; $btn.FlatStyle = "Flat"
+            
+            $btn.Add_Click({
+                $btn.Text = "Aguarde..."; $btn.Enabled = $false; [System.Windows.Forms.Application]::DoEvents()
+                $res = Get-WorkingHoursStatus
+                if ($res.action -eq "allow") { 
+                    $timer.Stop(); $Global:PodeFechar = $true; foreach($frm in $Forms){$frm.Close()}; Desbloquear-Ambiente 
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show($res.message, "Aviso de Horário", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                    $btn.Text = "VERIFICAR HORÁRIO"; $btn.Enabled = $true
+                }
+            })
+            $pnlBtn.Controls.Add($btn)
+        } else {
+            $lbl = New-Object System.Windows.Forms.Label; $lbl.Text = "FORA DO HORÁRIO"; $lbl.ForeColor = [System.Drawing.Color]::FromArgb(40,40,40); $lbl.Font = "Segoe UI, 40, Bold"; $lbl.Dock = "Fill"; $lbl.TextAlign = "MiddleCenter"; $f.Controls.Add($lbl)
+        }
+        $Forms.Add($f)
+    }
+    $timer.Start(); foreach ($frm in $Forms) { if ($frm -ne $Global:MainForm) { $frm.Show() } }; $Global:MainForm.ShowDialog()
+}
+
+# =========================================================================
+# 3. COMUNICAÇÃO API E 4. LOOP PRINCIPAL
+# =========================================================================
+
+function Send-VerifyMachine {
+    param ([string]$CpfDigitado)
+    $net = Get-NetworkData; $loc = Get-LocationData; $currentUser = Get-LoggedOnUser
+    $payload = @{ hostname = $script:Maquina; cpf = ($CpfDigitado -replace "[^0-9]", ""); mac_address = $net.mac; ip_address = $net.ip; wifiAccessPoints = $loc.wifi; latitude = $loc.lat; longitude = $loc.lng; os_version = (Get-WmiObject Win32_OperatingSystem).Caption; username = $currentUser }
+    try { return Invoke-RestMethod -Uri "$script:UrlBase/verify" -Method Post -Body ($payload | ConvertTo-Json -Compress) -ContentType "application/json" }
+    catch { return @{ action = "block_manual"; message = "Sem conexão com o servidor." } }
+}
+
+function Get-WorkingHoursStatus {
+    try { return Invoke-RestMethod -Uri "$script:UrlBase/check-working-hours" -Method Post -Body (@{hostname=$script:Maquina} | ConvertTo-Json -Compress) -ContentType "application/json" }
+    catch { return @{ action = "allow" } }
 }
 
 function Send-ActiveWindowLog {
-    $hwnd = [Win32]::GetForegroundWindow()
-    $sb = New-Object System.Text.StringBuilder 256
+    $hwnd = [Win32]::GetForegroundWindow(); $sb = New-Object System.Text.StringBuilder 256
     if ([Win32]::GetWindowText($hwnd, $sb, $sb.Capacity) -gt 0) {
-        
-        $title = [string]($sb.ToString() | Out-String).Trim() -replace "`r|`n|`t", " " -replace '"', "'"
-        if ($title.Length -gt 250) { $title = $title.Substring(0, 250) }
-
-        # --- A CORREÇÃO QUE DEIXA O CÓDIGO CAPTURAR O CHROME ---
-        $procId = 0
-        [Win32]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
+        $procId = 0; [Win32]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
         $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-        
-        $processName = if($proc){[string]($proc.Name | Out-String).Trim() -replace "`r|`n", ""}else{"Desconhecido"}
-        if ($processName.Length -gt 150) { $processName = $processName.Substring(0, 150) }
-        
-        $isBrowser = $processName -match "chrome|msedge|firefox|brave|opera"
-        $eventType = if ($isBrowser) { "historico_web" } else { "janela_ativa" }
-
-        $event = [PSCustomObject]@{
-            username = [string]$env:USERNAME
-            event_type = $eventType
-            active_window_title = $title
-            process_name = $processName
-            event_at = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        }
-
-        $payload = @{
-            hostname = $script:Maquina
-            events = @($event) 
-        }
-
-        $jsonString = $payload | ConvertTo-Json -Depth 5 -Compress
-        $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($jsonString)
-
-        try { 
-            Invoke-RestMethod -Uri "$script:UrlBase/user-info" -Method Post -Body $jsonBytes -ContentType "application/json; charset=utf-8" | Out-Null
-            Write-Host "[OK] Telemetria ($eventType): [$processName] $title" -ForegroundColor DarkGray
-        } catch {
-            Write-Host "[ERRO] Falha ao enviar Telemetria: $($_.Exception.Message)" -ForegroundColor Red
-        }
+        $payload = @{ hostname = $script:Maquina; events = @(@{ username = Get-LoggedOnUser; event_type = "janela_ativa"; active_window_title = $sb.ToString(); process_name = if($proc){$proc.Name}else{"?"}; event_at = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }) }
+        try { Invoke-RestMethod -Uri "$script:UrlBase/user-info" -Method Post -Body ($payload | ConvertTo-Json -Compress) -ContentType "application/json" | Out-Null } catch {}
     }
 }
 
-# =========================================================================
-# 5. LOOP PRINCIPAL DE EXECUÇÃO
-# =========================================================================
-Write-Host "Agente PLATTrust Iniciado. (Modo Teste: $script:ModoTeste)" -ForegroundColor Green
-
-$UltimaSincronizacaoApps = (Get-Date).AddDays(-1) 
-
 while ($true) {
+    if ((Get-Date) -gt $script:UltimaColetaApps.AddHours(1)) { Send-ApplicationsLog; $script:UltimaColetaApps = Get-Date }
+
     $vCpf = if (Test-Path $script:ArquivoCache) { (Get-Content $script:ArquivoCache).Trim() } else { "" }
-    
-    # 1. VERIFY
     $statusIdentidade = Send-VerifyMachine -CpfDigitado $vCpf
     $statusHorario = Get-WorkingHoursStatus
 
-    # 2. SINCRONIZA APPS
-    $TempoDecorrido = (Get-Date) - $UltimaSincronizacaoApps
-    if ($TempoDecorrido.TotalHours -ge 1) {
-        Send-ApplicationsList
-        $UltimaSincronizacaoApps = Get-Date
-    }
-
-    if ($statusIdentidade.action -eq "block") {
-        if ($statusIdentidade.message -match "quis|suspenso|administrador") {
-            Show-TelaManual -Mensagem $statusIdentidade.message
-        } else {
-            Show-TelaTermo -Mensagem $statusIdentidade.message
-        }
-    } 
-    elseif ($statusHorario.action -eq "block") {
-        Show-TelaHorario -Mensagem $statusHorario.message
-    }
-
-    # 3. ENVIA O HISTÓRICO WEB / JANELA ATIVA
-    if ($statusIdentidade.action -eq "allow" -and $statusHorario.action -eq "allow") {
-        Send-ActiveWindowLog
-    }
-
+    if ($statusIdentidade.action -eq "block_manual") { Show-TelaManual -Mensagem $statusIdentidade.message } 
+    elseif ($statusIdentidade.action -eq "block_termo" -or $statusIdentidade.action -eq "block") { Show-TelaTermo -Mensagem $statusIdentidade.message }
+    elseif ($statusHorario.action -eq "block") { Show-TelaHorario -Mensagem $statusHorario.message }
+    else { Send-ActiveWindowLog }
+    
     Start-Sleep -Seconds 15
 }
